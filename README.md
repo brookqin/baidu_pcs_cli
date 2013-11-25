@@ -69,7 +69,7 @@ sync     [选项] [远程路径] [本地路径] 同步文件或者目录
 本人Linux、C方面是小白，周末在家配置路由器`BUFFALO WZR-HP-G300NH2`的远程下载时想到这个好工具，
 无奈没有可以在dd-wrt上运行的版本，于是想自己动手编译，不料掉入cross compile深坑，
 费半天时间在OS X下尝试失败，因为教程几乎一水Linux下于是转战Ubuntu。
-还好功夫不负有心人搭近周末编译出了MIPS版。
+还好功夫不负有心人搭近周末编译出了[MIPS版](https://github.com/brookqin/baidu_pcs_cli/releases)。
 
 在此感谢原作者 [@emptyhua](https://github.com/emptyhua) 无私分享的优秀代码，我后来添加的那些代码已经无法直视了。
 
