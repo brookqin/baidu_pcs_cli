@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013 emptyhua@gmail.com
+ * Copyright (c) 2013 brook.qin@gmail.com
  */
 
 
@@ -15,19 +16,23 @@
 #include <dirent.h>
 #include <libgen.h>
 #include <stdarg.h>
+#include <signal.h>
 
 #include "pcs.h"
 
 #define COLOR_LOG_OK        1
 #define COLOR_LOG_ERROR     2 
 #define COLOR_LOG_IGNORE    3 
+#define MAX_LINE_LEN        512
 
 /* pcs api key */
-static const char *option_api_key     = "";
+static char option_api_key[32];
 /* pcs api secret */
-static const char *option_api_secret  = "";
+static char option_api_secret[32];
 
 static BaiduPCS *api = NULL;
+
+static int sync_running = 0;
 
 void color_log(int type, const char *format, ...) {
 //{{{
@@ -124,6 +129,9 @@ void usage() {
     fprintf(stderr,
 "使用方法: baidu_pcs 命令 [选项]\n"
 "\n"
+"说明:\n"
+"    配置文件必须放在 /etc/baidupcs.conf 或者 ~/baidupcs.conf \n"
+"\n"
 "命令列表:\n"
 "\n"
 "info      查看云盘信息\n"
@@ -147,12 +155,39 @@ void usage() {
 "          选项:\n"
 "            -o 覆盖本地同名文件\n"
 "            -n 如果存在同名文件，创建以日期结尾的新文件\n"
+"\n"
 "cp       [远程路径] [目的远程路径] 复制远程文件或目录\n"
 "mv       [远程路径] [目的远程路径] 移动远程文件或目录\n"
 "rm       [远程路径] 删除远程文件或目录\n"
+"\n"
+"sync     [选项] [远程路径] [本地路径] 同步文件或者目录\n"
+"          选项:\n"
+"            默认:略过已存在同名文件\n"
+"            -o 覆盖同名文件\n"
+"            -n 如果存在同名文件，创建以日期结尾的新文件\n"
     );
 }
 //}}}
+
+/* deamon method */
+void init_daemon()
+{
+    pid_t pid;
+    if ((pid = fork()) != 0)
+        exit(0);
+    setsid();
+    if ((pid = fork()) != 0)
+        exit(0);
+    chdir("/");
+    umask(0);
+}
+
+void handle_term_signal (int sig)
+{
+    sync_running = 0;
+    sleep(10);
+    exit(0);
+}
 
 /* 初始化API */
 int init_api() {
@@ -934,13 +969,15 @@ int create_new             /* 是否新建 */
             remote_root_offset = strlen(file->path);
             if (stat(local_path, &(api->file_st)) != -1) {
                 if (S_ISDIR(api->file_st.st_mode)){
+/*
                     t_local_root[0] = '\0';
                     strcat(t_local_root, local_path);
                     strcat(t_local_root, "/");
                     strcat(t_local_root, basename(file->path));
 #ifdef DEBUG
                     fprintf(stderr, "本地根目录修正为:%s\n", t_local_root);
-#endif
+#endif   
+*/
                 } else {
                     color_log(COLOR_LOG_ERROR, "%s -> %s 本地已存与目录同名的文件\n", file->path, local_path);
                     ret = 1;
@@ -1026,9 +1063,78 @@ free:
 }
 //}}}
 
-
 /* 下载文件或目录 */
 int command_download(int argc, char **argv) {
+//{{{
+    int option_overwrite    = 0; /* 覆盖同名文件        */
+    int option_new          = 0; /* 创建新文件          */
+
+    int ret = 0;
+    char c;
+
+    char *remote_path;
+    char *local_path;
+    
+    opterr = 0;
+    while ((c = getopt(argc, argv, "on")) != -1) {
+        switch (c) {
+            case 'o':
+                option_overwrite = 1;
+                break;
+            case 'n':
+                option_new = 1;
+                break;
+        }
+    }
+ 
+    if (option_overwrite && option_new) {
+        color_log(COLOR_LOG_ERROR, "请不要同时指定-n -o\n");
+        ret = 1;
+        goto free;
+    }
+
+#ifdef DEBUG
+    fprintf(stderr, "optind: %d,argc %d\n", optind, argc);
+#endif
+
+    if (optind < argc - 2) {
+        color_log(COLOR_LOG_ERROR, "请指定路径\n");
+        usage();
+        ret = 1;
+        goto free;
+    }
+
+    local_path = argv[argc - 1];
+    if (local_path[strlen(local_path) - 1] == '/') {
+        local_path[strlen(local_path) - 1] = '\0';
+    }
+
+    remote_path = argv[argc - 2];
+    if (remote_path[strlen(remote_path) - 1] == '/') {
+        remote_path[strlen(remote_path) - 1] = '\0';
+    }
+
+#ifdef DEBUG
+    fprintf(stderr, "Download %s to %s\n", local_path, remote_path);
+#endif
+
+    if (!init_api()) {
+        ret = 1;
+        goto free;
+    }
+    
+    ret = do_download(remote_path,
+                    local_path,
+                    option_overwrite, 
+                    option_new);
+free:
+    return ret;
+} 
+//}}}
+
+
+/* 同步文件，实际只是循环调用 do_download */
+int command_sync(int argc, char **argv) {
 //{{{
     int option_overwrite    = 0; /* 覆盖同名文件        */
     int option_new          = 0; /* 创建新文件          */
@@ -1074,24 +1180,30 @@ int command_download(int argc, char **argv) {
         remote_path[strlen(remote_path) - 1] = '\0';
     }
 
-#ifdef DEBUG
-    fprintf(stderr, "Download %s to %s\n", local_path, remote_path);
-#endif
-
     if (!init_api()) {
         ret = 1;
         goto free;
     }
-    
-    ret = do_download(remote_path,
+
+    init_daemon();
+
+    sync_running = 1;
+    while (sync_running == 1) {
+        
+        ret = do_download(remote_path,
                     local_path,
                     option_overwrite, 
                     option_new);
+
+        color_log(COLOR_LOG_OK, "15 秒后开始下次同步.\n");
+
+        sleep(15);
+    }
+
 free:
     return ret;
-} 
 //}}}
-
+}
 
 /* 移动，复制 */
 int command_move_or_copy(int argc, char **argv, const char *type) {
@@ -1168,14 +1280,70 @@ free:
 }
 //}}}
 
+int read_config() {
+
+    struct passwd *pw;
+    const char *homedir;
+    char config[1024];
+
+    FILE *config_fp;
+    char line[MAX_LINE_LEN + 1];
+    char *token ;
+    int ret = 0;
+    
+    config_fp = fopen("/etc/baidupcs.conf", "r") ;
+    if(config_fp == NULL) {
+        pw = getpwuid(getuid());
+        homedir = pw->pw_dir;
+        snprintf(config, 1023, "%s/baidupcs.conf",  homedir);
+
+        config_fp = fopen(config, "r");
+    }
+    
+    if(config_fp != NULL) {
+        while(fgets(line, MAX_LINE_LEN, config_fp) != NULL)
+        {
+            token = strtok(line, "\t =\n\r") ;
+            if(token != NULL && token[0] != '#')
+            {
+                if(strcmp(token, "apikey") == 0) {
+                    token = strtok(NULL, "\t =\n\r");
+                    sprintf(option_api_key, "%s", token);
+                }
+                else if(strcmp(token, "apisecret") == 0) {
+                    token = strtok(NULL, "\t =\n\r");
+                    sprintf(option_api_secret, "%s", token);
+                }
+            }
+        }
+
+        if(*option_api_key == '\0' || *option_api_secret == '\0') ret = 1;
+
+        fclose(config_fp);
+        config_fp = NULL;
+    }
+    else {
+        ret = 1;
+        color_log(COLOR_LOG_ERROR, "%s\n", "没有找到配置文件!");
+    }
+
+#ifdef DEBUG
+    fprintf(stderr, "key: %s \nsec: %s\n", option_api_key, option_api_secret);
+#endif
+
+    return ret;
+}
+
 int main(int argc, char **argv) {
 //{{{
     int ret = 0;
 
-    if (argc < 2) {
+    if (argc < 2 || read_config() > 0) {
         usage();
         return 1;
     }
+
+    signal(SIGTERM, handle_term_signal);
     
     char *command = argv[1];
 
@@ -1198,6 +1366,8 @@ int main(int argc, char **argv) {
         ret = command_move_or_copy(argc, argv, "cp");
     } else if (strcmp(command, "rm") == 0) {
         ret = command_remove(argc, argv);
+    } else if (strcmp(command, "sync") == 0) {
+        ret = command_sync(argc, argv);
     } else {
         color_log(COLOR_LOG_ERROR, "未知命令!\n");
         usage();
